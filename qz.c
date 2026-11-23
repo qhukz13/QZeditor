@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <stdarg.h>
 #include <fcntl.h>
@@ -46,6 +47,7 @@
 #endif
 
 #define CTRL_KEY(k) ((k) & 0x1f)
+#define SHIFT_MOD 0x1000
 
 enum editorKey {
   BACKSPACE = 127,
@@ -62,7 +64,9 @@ enum editorKey {
   CTRL_ARROW_RIGHT,
   CTRL_HOME,
   CTRL_END,
-  SHIFT_TAB
+  SHIFT_TAB,
+  PASTE_START,
+  UNKNOWN_KEY
 };
 
 enum editorHighlight {
@@ -134,6 +138,8 @@ struct editorConfig {
     int cx, cy;
     int rx;
     int wantrx;
+    int sel_active;
+    int sel_cx, sel_cy;
     int rowoff;
     int coloff;
     int screenrows;
@@ -143,6 +149,8 @@ struct editorConfig {
     int numrows;
     erow *row;
     struct undoLog undo;
+    char *clipboard;
+    int cliplen;
     char *filename;
     struct timespec mtime;
     char statusmsg[80];
@@ -184,6 +192,9 @@ void editorRefreshScreen();
 void editorUpdateWindowSize();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorUndoPush(int type, int y, int x, const char *text, int len);
+void editorCopyToTerminal();
+const char *editorCopyToSystem();
+void editorPasteFromSystem();
 
 /*** terminal ***/
 
@@ -196,6 +207,7 @@ void die(const char *s) {
 }
 
 void disableRawMode() {
+    write(STDOUT_FILENO, "\x1b[?2004l", 8);
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
         die("tcsetattr");
 }
@@ -213,6 +225,8 @@ void enableRawMode() {
     raw.c_cc[VTIME] = 1;
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+
+    write(STDOUT_FILENO, "\x1b[?2004h", 8);
 }
 
 int editorReadKey() {
@@ -236,7 +250,7 @@ int editorReadKey() {
         char final = seq[1];
         while (final >= 0x30 && final <= 0x3f) {
             if (plen < (int)sizeof(params) - 1) params[plen++] = final;
-            if (read(STDIN_FILENO, &final, 1) != 1) return '\x1b';
+            if (read(STDIN_FILENO, &final, 1) != 1) return UNKNOWN_KEY;
         }
         params[plen] = '\0';
 
@@ -247,17 +261,18 @@ int editorReadKey() {
             mod = 5;
         }
 
-        int key = '\x1b';
+        int key = UNKNOWN_KEY;
 
         if (final == '~') {
             switch (num) {
-                case '1': key = HOME_KEY; break;
-                case '3': key = DEL_KEY; break;
-                case '4': key = END_KEY; break;
-                case '5': key = PAGE_UP; break;
-                case '6': key = PAGE_DOWN; break;
-                case '7': key = HOME_KEY; break;
-                case '8': key = END_KEY; break;
+                case 1: key = HOME_KEY; break;
+                case 3: key = DEL_KEY; break;
+                case 4: key = END_KEY; break;
+                case 5: key = PAGE_UP; break;
+                case 6: key = PAGE_DOWN; break;
+                case 7: key = HOME_KEY; break;
+                case 8: key = END_KEY; break;
+                case 200: key = PASTE_START; break;
             }
       } else {
         switch (final) {
@@ -271,12 +286,22 @@ int editorReadKey() {
         }
       }
 
-      if (mod == 5) {
+      if (mod == 5 || mod == 6) {
           switch (key) {
-              case ARROW_RIGHT: return CTRL_ARROW_RIGHT;
-              case ARROW_LEFT: return CTRL_ARROW_LEFT;
-              case HOME_KEY: return CTRL_HOME;
-              case END_KEY: return CTRL_END;
+              case ARROW_RIGHT: return CTRL_ARROW_RIGHT; break;
+              case ARROW_LEFT: return CTRL_ARROW_LEFT; break;
+              case HOME_KEY: return CTRL_HOME; break;
+              case END_KEY: return CTRL_END; break;
+          }
+      }
+      if (mod == 2 || mod == 6) {
+          switch(key) {
+              case ARROW_LEFT: case ARROW_RIGHT: case ARROW_UP: case ARROW_DOWN:
+              case HOME_KEY: case END_KEY: case PAGE_UP: case PAGE_DOWN:
+              case CTRL_ARROW_LEFT: case CTRL_ARROW_RIGHT:
+              case CTRL_HOME: case CTRL_END:
+                key |= SHIFT_MOD;
+                break;
           }
       }
       return key;
@@ -287,11 +312,56 @@ int editorReadKey() {
             case 'c': return CTRL_ARROW_RIGHT;
             case 'd': return CTRL_ARROW_LEFT;
         }
+
+    return UNKNOWN_KEY;
     }
     return '\x1b';
   } else {
     return c;
   }
+}
+
+int editorFixNewlines(char *s, int len) {
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (s[i] == '\r') {
+            s[j++] = '\n';
+            if (i + 1 < len &&  s[i + 1] == '\n') i++;
+        } else {
+            s[j++] = s[i];
+        }
+    }
+    return j;
+}
+
+char *editorReadPaste(int *len) {
+    const char *end = "\x1b[201~";
+    int endlen = strlen(end);
+    int cap = 128;
+    char *buf = malloc(cap);
+    int n = 0;
+    int quiet = 0;
+    while (1) {
+        char c;
+        int nread = read(STDIN_FILENO, &c, 1);
+        if (nread == -1 && errno != EAGAIN && errno != EINTR) die("read");
+        if (nread != 1) {
+            if (++quiet == 10) break;
+            continue;
+        }
+        quiet = 0;
+        if (n == cap) {
+            cap *= 2;
+            buf = realloc(buf, cap);
+        }
+        buf[n++] = c;
+        if (n >= endlen && memcmp(&buf[n - endlen], end, endlen) == 0) {
+            n -= endlen;
+            break;
+        }
+    }
+    *len = editorFixNewlines(buf, n);
+    return buf;
 }
 
 int getCursorPosition(int *rows, int *cols) {
@@ -676,7 +746,7 @@ void editorUpdateRow(erow *row){
     editorUpdateSyntax(row);
 }
 
-void editorInsertRow(int at, char *s, size_t len) {
+void editorInsertRow(int at, const char *s, size_t len) {
     if (at < 0 || at > E.numrows) return;
     editorUndoPush(UNDO_INSERT_ROW, at, 0, s, len);
 
@@ -966,6 +1036,160 @@ void editorBackspace() {
     editorDelChar();
 }
 
+void editorDeleteRange(int y1, int x1, int y2, int x2) {
+    if(y2 == E.numrows) {
+        if (x1 == 0) {
+            while (E.numrows > y1) editorDelRow(E.numrows - 1);
+            E.cy = y1;
+            E.cx = 0;
+            return;
+        }
+        y2--;
+        x2 = E.row[y2].size;
+    }
+
+    if (y1 == y2) {
+        editorRowDelChars(&E.row[y1], x1, x2 - x1);
+    } else {
+        erow *first = &E.row[y1];
+        erow *last = &E.row[y2];
+        editorRowDelChars(first, x1, first->size - x1);
+        editorRowAppendString(first, &last->chars[x2], last->size - x2);
+        for (int y = y2; y > y1; y--) editorDelRow(y);
+    }
+    E.cy = y1;
+    E.cx = x1;
+}
+
+void editorInsertText(const char *s, int len) {
+    int i = 0;
+    while (i < len) {
+        const char *nl = memchr(&s[i], '\n', len - i);
+        int n = nl ? nl - &s[i] : len - i;
+        int new_row = (E.cy == E.numrows);
+        if (new_row) editorInsertRow(E.numrows, &s[i], n);
+        else editorRowInsertString(&E.row[E.cy], E.cx, &s[i], n);
+        E.cx += n;
+        i += n;
+        if (nl) {
+            if (!new_row) {
+                erow *row = &E.row[E.cy];
+                editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+                editorRowDelChars(&E.row[E.cy], E.cx, E.row[E.cy].size - E.cx);
+            }
+            E.cy++;
+            E.cx = 0;
+            i++;
+        }
+    }
+}
+
+/*** selection ***/
+
+int editorGetSelection(int *y1, int *x1, int *y2, int *x2) {
+    if (!E.sel_active) return 0;
+    if (E.sel_cy < E.cy || (E.sel_cy == E.cy && E.sel_cx < E.cx)) {
+        *y1 = E.sel_cy;
+        *x1 = E.sel_cx;
+        *y2 = E.cy;
+        *x2 = E.cx;
+    } else {
+        *y1 = E.cy;
+        *x1 = E.cx;
+        *y2 = E.sel_cy;
+        *x2 = E.sel_cx;
+    }
+    return *y1 != *y2 || *x1 != *x2;
+}
+
+void editorSelectedColumns(int y, int *from, int *to) {
+    int y1, x1, y2, x2;
+    *from = *to = 0;
+    if (!editorGetSelection(&y1, &x1, &y2, &x2) || y < y1 || y > y2) return;
+    erow *row = &E.row[y];
+    *from = (y == y1) ? editorRowCxToRx(row, x1) : 0;
+    *to = (y == y2) ? editorRowCxToRx(row, x2) : editorRowCxToRx(row, row->size) + 1;
+}
+
+char *editorRangeToString(int y1, int x1, int y2, int x2, int *buflen) {
+    int len = 0;
+    for (int y = y1; y <= y2 && y < E.numrows; y++) {
+        int from = (y == y1) ? x1 : 0;
+        int to = (y == y2) ? x2 : E.row[y].size;
+        len += to - from;
+        if (y < y2) len++;
+    }
+
+    char *buf = malloc(len + 1);
+    char *p = buf;
+    for (int y = y1; y <= y2 && y < E.numrows; y++) {
+        int from = (y == y1) ? x1 : 0;
+        int to = (y == y2) ? x2 : E.row[y].size;
+        memcpy(p, &E.row[y].chars[from], to - from);
+        p += to - from;
+        if (y < y2) *p++ = '\n';
+    }
+    *p = '\0';
+    *buflen = len;
+    return buf;
+}
+
+int editorDeleteSelection() {
+    int y1, x1, y2, x2;
+    if (!editorGetSelection(&y1, &x1, &y2, &x2)) return 0;
+    editorDeleteRange(y1, x1, y2, x2);
+    E.sel_active = 0;
+    return 1;
+}
+
+const char *editorCopy() {
+    int y1, x1, y2, x2;
+    if (!editorGetSelection(&y1, &x1, &y2, &x2)) {
+        editorSetStatusMessage("Nothing selected");
+        return NULL;
+    }
+    free(E.clipboard);
+    E.clipboard = editorRangeToString(y1, x1, y2, x2, &E.cliplen);
+    const char *how  = editorCopyToSystem();
+    editorSetStatusMessage("Copied %d bytes %s", E.cliplen, how);
+    return how;
+}
+
+void editorCut(){
+    int y1, x1, y2, x2;
+    if (!editorGetSelection(&y1, &x1, &y2, &x2)) {
+        editorSetStatusMessage("Nothing selected");
+        return;
+    }
+    const char *how = editorCopy();
+    editorUndoBeginGroup();
+    editorDeleteRange(y1, x1, y2, x2);
+    editorUndoEndGroup();
+    editorSetStatusMessage("Cut %d bytes %s", E.cliplen, how);
+}
+
+void editorPaste() {
+    editorPasteFromSystem();
+    if (E.clipboard == NULL) {
+        editorSetStatusMessage("The clipboard is empty");
+        return;
+    }
+    editorUndoBeginGroup();
+    editorDeleteSelection();
+    editorInsertText(E.clipboard, E.cliplen);
+    editorUndoEndGroup();
+}
+
+void editorPasteFromTerminal() {
+    int len;
+    char *text = editorReadPaste(&len);
+    editorUndoBeginGroup();
+    editorDeleteSelection();
+    editorInsertText(text, len);
+    editorUndoEndGroup();
+    free(text);
+}
+
 /*** file i/o ***/
 
 char *editorRowToString(int *buflen) {
@@ -998,6 +1222,28 @@ ssize_t writeAll(int fd, const char *buf, size_t len) {
         done += n;
     }
     return done;
+}
+
+char *readAll(int fd, int *len) {
+    int cap = 1024;
+    int n = 0;
+    char *buf = malloc(cap);
+    while (1) {
+        if (n == cap) {
+            cap *= 2;
+            buf = realloc(buf, cap);
+        }
+        ssize_t r = read(fd, buf + n, cap - n);
+        if (r == 0) break;
+        if (r == -1) {
+            if (errno == EINTR) continue;
+            free(buf);
+            return NULL;
+        }
+        n += r;
+    }
+    *len = n;
+    return buf;
 }
 
 void fsyncParentDir(const char *path) {
@@ -1134,6 +1380,138 @@ void editorSave() {
         free(target);
         free(tmpname);
         free(buf);
+}
+
+/*** clipboard ***/
+
+const char base64chars[] =
+    "ABCDEFFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+char *base64Encode(const char *s, int len, int *outlen) {
+    const unsigned char *u = (const unsigned char *)s;
+    char *out = malloc((len + 2) / 3 * 4 + 1);
+    int o = 0;
+    int i;
+    for (i = 0; i + 2 < len; i += 3) {
+        int bits = (u[i] << 16) | (u[i + 1] << 0) | u[i + 2];
+        out[o++] = base64chars[(bits >> 18) & 63];
+        out[o++] = base64chars[(bits >> 12) & 63];
+        out[o++] = base64chars[(bits >> 6) & 63];
+        out[o++] = base64chars[bits & 63];
+    }
+    if (i < len) {
+        int bits = u[i] << 16;
+        if (i + 1 < len) bits |= u[i + 1] << 8;
+        out[o++] = base64chars[(bits >> 18) & 63];
+        out[o++] = base64chars[(bits >> 12) & 63];
+        out[o++] = (i + 1 < len) ? base64chars[(bits >> 6) & 63] : '=';
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+    *outlen = o;
+    return out;
+}
+
+void editorCopyToTerminal() {
+    int len;
+    char *b64 = base64Encode(E.clipboard, E.cliplen, &len);
+    writeAll(STDOUT_FILENO, "\x1b]52;c;", 7);
+    writeAll(STDOUT_FILENO, b64, len);
+    writeAll(STDOUT_FILENO, "\x07", 1);
+    free(b64);
+}
+
+void helperExec(char *const argv[], int fd_in, int fd_out) {
+    int null = open("/dev/null", O_RDWR);
+    if (null == -1) _exit(127);
+    dup2(fd_in != -1 ? fd_in : null, STDIN_FILENO);
+    dup2(fd_out != -1 ? fd_out : null, STDOUT_FILENO);
+    dup2(null, STDERR_FILENO);
+    close(null);
+    if (fd_in != -1) close(fd_in);
+    if (fd_out != -1) close(fd_out);
+
+    signal(SIGPIPE, SIG_DFL);
+    execvp(argv[0], argv);
+    _exit(127);
+}
+
+int helperWait(pid_t pid) {
+    int status;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) return -1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+int helperWrite(char *const argv[], const char *text, int len) {
+    int fds[2];
+    if (pipe(fds) == -1) return -1;
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(fds[1]);
+        helperExec(argv, fds[0], -1);
+    }
+    close(fds[0]);
+    int written = writeAll(fds[1], text, len) != -1;
+    close(fds[1]);
+    int status = helperWait(pid);
+    return written ? status : -1;
+}
+
+char *helperRead(char *const argv[], int *len) {
+    int fds[2];
+    if (pipe(fds) == -1) return NULL;
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(fds[0]);
+        close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        helperExec(argv, -1, fds[1]);
+    }
+    close(fds[1]);
+    char *text = readAll(fds[0], len);
+    close(fds[0]);
+    if (helperWait(pid) != 0) {
+        free(text);
+        return NULL;
+    }
+    return text;
+}
+
+const char *editorCopyToSystem() {
+    if (getenv("WAYLAND_DISPLAY")) {
+        char *argv[] = { "wl-copy", NULL };
+        if (helperWrite(argv, E.clipboard, E.cliplen) == 0) return "with wl-copy";
+    }
+    if (getenv("DISPLAY")) {
+        char *argv[] = { "xclip", "-selection", "clipboard", NULL };
+        if (helperWrite(argv, E.clipboard, E.cliplen) == 0) return "with xclip";
+    }
+    editorCopyToTerminal();
+    return "via the terminal";
+}
+
+void editorPasteFromSystem() {
+    char *text = NULL;
+    int len;
+    if (getenv("WAYLAND_DISPLAY")) {
+        char *argv[] = { "wl-paste", "--no-newline", NULL };
+        text = helperRead(argv, &len);
+    }
+    if (text == NULL) return;
+    free(E.clipboard);
+    E.clipboard = text;
+    E.cliplen = editorFixNewlines(text, len);
 }
 
 /*** find ***/
@@ -1274,19 +1652,24 @@ void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
     int filerow = y + E.rowoff;
+
     if (filerow >= E.numrows) {
       for (int i = 0; i < E.gutter; i++) abAppend(ab, " ", 1);
       if (E.numrows == 0 && y == E.screenrows / 3) {
         char welcome[80];
         int welcomelen = snprintf(welcome, sizeof(welcome),
           "QZeditor -- version %s", QZ_VERSION);
+
         if (welcomelen > E.textcols) welcomelen = E.textcols;
+
         int padding = (E.textcols - welcomelen) / 2;
+
         if (padding) {
           abAppend(ab, "~", 1);
           padding--;
         }
         while (padding--) abAppend(ab, " ", 1);
+
         abAppend(ab, welcome, welcomelen);
       } else {
         abAppend(ab, "~", 1);
@@ -1295,33 +1678,52 @@ void editorDrawRows(struct abuf *ab) {
       if (E.gutter > 0) {
         char num[16];
         int numlen = snprintf(num, sizeof(num), "%*d ", E.gutter - 1, filerow + 1);
+
         if (filerow == E.cy) abAppend(ab, "\x1b[1m", 4);
         else abAppend(ab, "\x1b[90m", 5);
+
         abAppend(ab, num, numlen);
         abAppend(ab, "\x1b[m", 3);
       }
+
       char *c = E.row[filerow].render;
       unsigned char *hl = E.row[filerow].hl;
       int len = E.row[filerow].rsize;
       int current_color = -1;
+      int sel_from, sel_to;
+      editorSelectedColumns(filerow, &sel_from, &sel_to);
+      int in_sel = 0;
       int col = 0;
       int j = 0;
       int bytes;
       int shown = 0;
+
       while (j < len) {
         int width = editorCharWidth(&c[j], len - j, &bytes);
         int cols = (width < 0) ? 1 : width;
+
         if (col + cols > E.coloff + E.textcols) break;
+
+        int sel = (col >= sel_from && col < sel_to);
+
+        if (sel != in_sel) {
+            if (sel) abAppend(ab, "\x1b[7m", 4);
+            else abAppend(ab, "\x1b[27m", 5);
+            in_sel = sel;
+        }
+
         int hide = (col < E.coloff) || (width == 0 && !shown);
         shown = !hide && width >= 0;
+
         if (hide) {
           for (int k = col; k < col + cols; k++)
               if (k >= E.coloff) abAppend(ab, " ", 1);
         } else if (width < 0) {
           char sym = ((unsigned char)c[j] <= 26) ? '@' + c[j] : '?';
-          abAppend(ab, "\x1b[7m", 4);
+          abAppend(ab, in_sel ? "\x1b[27m" : "\x1b[7m", in_sel ? 5 : 4);
           abAppend(ab, &sym, 1);
-          abAppend(ab, "\x1b[m", 3);
+          abAppend(ab, in_sel ? "\x1b[7m" : "\x1b[27m", in_sel ? 4 : 5);
+
           if (current_color != -1) {
             char buf[16];
             int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
@@ -1332,22 +1734,37 @@ void editorDrawRows(struct abuf *ab) {
             abAppend(ab, "\x1b[39m", 5);
             current_color = -1;
           }
+
           abAppend(ab, &c[j], bytes);
         } else {
           int color = editorSyntaxToColor(hl[j]);
+
           if (color != current_color) {
             current_color = color;
             char buf[16];
             int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
             abAppend(ab, buf, clen);
           }
+
           abAppend(ab, &c[j], bytes);
         }
+
         col += cols;
         j += bytes;
       }
+
+      if (j == len && col < sel_to && col >= E.coloff &&
+          col < E.coloff + E.textcols) {
+              if (!in_sel) abAppend(ab, "\x1b[7m", 4);
+              abAppend(ab, " ", 1);
+              in_sel = 1;
+          }
+
+      if (in_sel) abAppend(ab, "\x1b[27m", 5);
       abAppend(ab, "\x1b[39m", 5);
+
     }
+
     abAppend(ab, "\x1b[K", 3);
     abAppend(ab, "\r\n", 2);
   }
@@ -1429,6 +1846,7 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
     editorSetStatusMessage(prompt, buf);
     editorRefreshScreen();
     int c = editorReadKey();
+    if (c == UNKNOWN_KEY) continue;
     if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
       if (buflen != 0) {
           buflen = editorPrevChar(buf, buflen, buflen);
@@ -1452,6 +1870,20 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
       }
       buf[buflen++] = c;
       buf[buflen] = '\0';
+    } else if (c == PASTE_START) {
+        int len;
+        char *text = editorReadPaste(&len);
+        for (int i = 0; i < len && text[i] != '\n'; i++) {
+            unsigned char ch = text[i];
+            if (ch < 128 && iscntrl(ch)) continue;
+            if (buflen == bufsize - 1) {
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+            buf[buflen++] = ch;
+        }
+        buf[buflen] = '\0';
+        free(text);
     }
     if (callback) callback(buf, c);
   }
@@ -1559,14 +1991,23 @@ void editorProcessKeypress() {
     static int quit_times = QZ_QUIT_TIMES;
     static int last_typed = 0;
     int c = editorReadKey();
+    int shift = c & SHIFT_MOD;
+    c &= ~SHIFT_MOD;
 
     int typed = (c < 256 && (c >= 128 || !iscntrl(c))) ? c : 0;
     if (!typed || !last_typed || (typed == ' ' && last_typed != ' '))
         editorUndoBreak();
     last_typed = typed;
 
+    if (shift && !E.sel_active) {
+        E.sel_active = 1;
+        E.sel_cx = E.cx;
+        E.sel_cy = E.cy;
+    }
+
     switch (c){
         case '\r':
+            editorDeleteSelection();
             editorInsertNewLine();
             break;
 
@@ -1588,6 +2029,7 @@ void editorProcessKeypress() {
             break;
 
         case '\t':
+            editorDeleteSelection();
             editorInsertTab();
             break;
 
@@ -1620,8 +2062,32 @@ void editorProcessKeypress() {
             }
             break;
 
+        case CTRL_KEY('a'):
+            E.sel_active = 1;
+            E.sel_cx = 0;
+            E.sel_cy = 0;
+            E.cx = 0;
+            E.cy = E.numrows;
+            break;
+
+        case CTRL_KEY('c'):
+            editorCopy();
+            break;
+
         case CTRL_KEY('z'):
             editorUndo();
+            break;
+
+        case CTRL_KEY('x'):
+            editorCut();
+            break;
+
+        case CTRL_KEY('v'):
+            editorPaste();
+            break;
+
+        case PASTE_START:
+            editorPasteFromTerminal();
             break;
 
         case CTRL_KEY('y'):
@@ -1629,6 +2095,7 @@ void editorProcessKeypress() {
             break;
 
         case CTRL_KEY('f'):
+            E.sel_active = 0;
             editorFind();
             break;
 
@@ -1639,6 +2106,7 @@ void editorProcessKeypress() {
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DEL_KEY:
+            if (editorDeleteSelection()) break;
             if (c == DEL_KEY) {
                 editorMoveCursor(ARROW_RIGHT);
                 editorDelChar();
@@ -1679,8 +2147,10 @@ void editorProcessKeypress() {
 
         case CTRL_KEY('l'):
         case '\x1b':
+        case UNKNOWN_KEY:
             break;
         default:
+            editorDeleteSelection();
             editorInsertChar(c);
             break;
     }
@@ -1688,6 +2158,7 @@ void editorProcessKeypress() {
         E.wantrx = -1;
     }
 
+    if (!shift && c != CTRL_KEY('a') && c != CTRL_KEY('c')) E.sel_active = 0;
     quit_times = QZ_QUIT_TIMES;
 }
 
@@ -1698,6 +2169,9 @@ void initEditor() {
     E.cy = 0;
     E.rx = 0;
     E.wantrx = -1;
+    E.sel_active = 0;
+    E.sel_cx = 0;
+    E.sel_cy = 0;
     E.rowoff = 0;
     E.coloff = 0;
     E.gutter = 0;
@@ -1714,6 +2188,8 @@ void initEditor() {
     E.undo.cx = 0;
     E.undo.cy = 0;
     E.undo.saved = 0;
+    E.clipboard = NULL;
+    E.cliplen = 0;
     E.filename = NULL;
     E.mtime.tv_sec = 0;
     E.mtime.tv_nsec = 0;
@@ -1723,6 +2199,7 @@ void initEditor() {
 
     editorUpdateWindowSize();
     enableResizeSignal();
+    signal(SIGPIPE, SIG_IGN);
 }
 
 int main(int argc, char *argv[]) {
